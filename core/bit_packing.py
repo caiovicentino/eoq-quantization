@@ -21,6 +21,7 @@ import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +241,108 @@ def unpack_codes_fast(packed: torch.Tensor, bits: int, n_elements: int) -> torch
     if bits == 5:
         return _unpack_q5_fast(packed, n_elements)
     return unpack_codes(packed, bits, n_elements)
+
+
+# ===================================================================
+# GPU-accelerated unpack / dequant
+# ===================================================================
+
+def unpack_codes_gpu(packed: torch.Tensor, bits: int, n_elements: int) -> torch.Tensor:
+    """GPU-accelerated unpacking. Works on CUDA tensors.
+
+    For Q4: simple nibble unpacking with torch ops (no numpy)
+    For other bits: bitwise operations on GPU
+
+    Returns int8 tensor on same device as input.
+    """
+    device = packed.device
+    offset = 1 << (bits - 1)
+
+    if bits == 4:
+        # Fast Q4: nibble unpack
+        low = (packed & 0x0F).to(torch.int16)
+        high = ((packed >> 4) & 0x0F).to(torch.int16)
+        result = torch.empty(packed.numel() * 2, dtype=torch.int8, device=device)
+        result[0::2] = (low - offset).to(torch.int8)
+        result[1::2] = (high - offset).to(torch.int8)
+        return result[:n_elements]
+
+    if bits == 8:
+        return packed.to(torch.int8)[:n_elements]
+
+    # General GPU path for Q2, Q3, Q5, Q6, Q7
+    result = torch.zeros(n_elements, dtype=torch.int16, device=device)
+    bit_positions = torch.arange(n_elements, dtype=torch.int64, device=device) * bits
+
+    for b in range(bits):
+        target_bit = bit_positions + b
+        byte_idx = (target_bit >> 3).long()
+        bit_idx = (target_bit & 7).to(torch.uint8)
+        bit_vals = (packed[byte_idx] >> bit_idx) & 1
+        result += bit_vals.to(torch.int16) << b
+
+    return (result - offset).to(torch.int8)
+
+
+def dequant_packed_gpu(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    bits: int,
+    n_elements: int,
+    shape: tuple,
+    block_size: int = 128
+) -> torch.Tensor:
+    """Full GPU pipeline: unpack + dequantize in one function.
+
+    packed: uint8 tensor on GPU
+    scales: fp16 tensor on GPU
+    Returns: fp16 tensor with original shape
+    """
+    # Unpack on GPU
+    codes = unpack_codes_gpu(packed, bits, n_elements).float()
+
+    # Dequantize
+    n = codes.numel()
+    pad = (block_size - n % block_size) % block_size
+    if pad > 0:
+        codes = F.pad(codes, (0, pad))
+    blocks = codes.view(-1, block_size)
+    result = (blocks * scales.float().unsqueeze(1)).flatten()[:n]
+    return result.view(shape).half()
+
+
+def benchmark_unpack_speed():
+    """Compare CPU vs GPU unpack speed."""
+    import time
+
+    for bits in [3, 4, 5, 6]:
+        n = 1_000_000
+        qmax = (1 << (bits-1)) - 1
+        codes_orig = torch.randint(-qmax, qmax+1, (n,), dtype=torch.int8)
+        packed = pack_codes_fast(codes_orig, bits)
+
+        # CPU
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cpu_result = unpack_codes_fast(packed, bits, n)
+        cpu_time = (time.perf_counter() - t0) / 10
+
+        # GPU (if available)
+        if torch.cuda.is_available():
+            packed_gpu = packed.cuda()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(10):
+                gpu_result = unpack_codes_gpu(packed_gpu, bits, n)
+                torch.cuda.synchronize()
+            gpu_time = (time.perf_counter() - t0) / 10
+
+            # Verify correctness
+            assert torch.equal(cpu_result, gpu_result.cpu())
+
+            print(f'Q{bits}: CPU {n/cpu_time/1e6:.1f} Melem/s | GPU {n/gpu_time/1e6:.1f} Melem/s | Speedup {cpu_time/gpu_time:.1f}x')
+        else:
+            print(f'Q{bits}: CPU {n/cpu_time/1e6:.1f} Melem/s | GPU: N/A')
 
 
 # ===================================================================
