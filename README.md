@@ -9,6 +9,7 @@ Simple absmax quantization + rANS entropy coding that matches complex GGUF K-qua
 | Qwen2.5-0.5B | 988 MB | 279 MB | — | 10.87 | 11.69 | +0.83 | 145.0 |
 | Qwen2.5-3B | 6,172 MB | 1,724 MB | — | 6.54 | 6.77 | +0.23 | 97.1 |
 | Qwen3.5-4B | 8,412 MB | 2,398 MB | — | 7.58 | 7.77 | +0.18 | 54.1 |
+| Qwen3.5-9B | 17,908 MB | 9,100 MB | 9.1 GB | 6.37 | 7.16 | +0.79 | 46.0 |
 | Qwen3.5-27B | 53,792 MB | 15,353 MB | 27.3 GB | 5.65 | 5.64 | -0.01 | 6.2 |
 | **Qwen3.5-35B-A3B** | **69,321 MB** | **19,680 MB** | **35.2 GB** | **5.19** | **5.39** | **+0.20** | **30.2** |
 | GLM-4.7-Flash (30B MoE) | 59,887 MB | 30,400 MB | 30.4 GB | 37.71 | 41.12 | +3.41 | 3.2 |
@@ -43,6 +44,7 @@ For speed improvement with reduced RAM, we developed custom CUDA INT4 kernels:
 | Qwen2.5-0.5B EOQ Q4/Q5/Q6/Q8 | [Q4](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q6) [Q8](https://huggingface.co/caiovicentino1/Qwen2.5-0.5B-EOQ-Q8) |
 | Qwen2.5-3B EOQ Q4/Q5/Q6 | [Q4](https://huggingface.co/caiovicentino1/Qwen2.5-3B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen2.5-3B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen2.5-3B-EOQ-Q6) |
 | Qwen3.5-4B EOQ Q4/Q5/Q6 | [Q4](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q4) [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q5) [Q6](https://huggingface.co/caiovicentino1/Qwen3.5-4B-EOQ-Q6) |
+| Qwen3.5-9B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-9B-EOQ-Q5-compressed) |
 | Qwen3.5-27B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-EOQ-Q5-compressed) |
 | Qwen3.5-35B-A3B EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/Qwen3.5-35B-A3B-EOQ-Q5-compressed) |
 | GLM-4.7-Flash EOQ Q5 (compressed) | [Q5](https://huggingface.co/caiovicentino1/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-EOQ-Q5-compressed) |
