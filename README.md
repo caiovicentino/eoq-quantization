@@ -78,20 +78,49 @@ AWQ saved scales reduced the PPL delta from +0.89 to +0.68 at identical download
 
 PolarQuant (TurboQuant-inspired): normalize blocks, Hadamard rotate to Gaussian, Lloyd-Max optimal quantize. Combined with AWQ achieves 93% reduction in quantization error — practically lossless.
 
-## Inference Speed
+## PolarEngine v4: Quantized Inference (NEW)
 
-EOQ models can be loaded with **torchao** for fast quantized inference with optimized CUDA kernels:
+Custom Triton kernel that keeps weights quantized in GPU VRAM -- no dequantization to FP16 needed.
 
 ### Benchmark (Qwen3.5-9B, RTX PRO 6000 Blackwell)
 
-| Method | tok/s | Speedup | VRAM | RAM Save |
-|--------|-------|---------|------|----------|
-| FP16 (baseline) | 45.7 | 1.00x | 17.9 GB | --- |
-| **torchao INT4** | **43.3** | **0.95x** | **6.3 GB** | **65%** |
-| BitsAndBytes NF4 | 34.6 | 0.76x | 7.7 GB | 57% |
-| EOQ QuantizedLinear | 6.7 | 0.15x | 8.2 GB | 54% |
+| Method | tok/s | VRAM | PPL | Notes |
+|--------|-------|------|-----|-------|
+| FP16 baseline | 45.7 | 17.9 GB | 6.37 | Reference |
+| torchao INT4 | 43.3 | 6.3 GB | 6.68 | Best speed/VRAM ratio |
+| BnB NF4 | 34.6 | 7.7 GB | ~6.7 | |
+| **PolarEngine v4** | **34.2** | **7.8 GB** | **6.89** | Custom Triton kernel |
+| **PolarEngine (package)** | **33.7** | **7.8 GB** | **6.89** | pip-installable plugin |
+| PolarEngine v3 | 11.8 | 12.1 GB | 6.89 | Before FWHT optimization |
 
-torchao INT4 achieves **95% of FP16 speed** with **65% less VRAM**. Combined with EOQ's 4.93 GB download, the full pipeline is:
+### Key Optimizations
+- **Matmul FWHT**: 25x faster Walsh-Hadamard via `torch.matmul(x, H128)` (1 kernel vs 29)
+- **FWHT cache**: Q/K/V projections reuse same result (69x total speedup)
+- **Pre-scaled centroids**: Lloyd-Max centroids x 1/sqrt(block_size) baked into lookup table
+- **INT4 nibble packing**: Half-block order, halves VRAM for Q3/Q4 layers (36% savings)
+- **Triton tiled GEMV**: Fused centroid lookup + dot product, autotuned per layer shape
+
+### vLLM Plugin
+
+Install and use as a vLLM quantization method:
+
+```bash
+pip install git+https://github.com/caiovicentino/polarengine-vllm.git
+```
+
+```python
+# Quantize
+python -m polarengine_vllm.quantize --model Qwen/Qwen3.5-9B --output ./polar-9b/
+
+# Serve (when vLLM supports the plugin)
+vllm serve ./polar-9b/ --quantization polarengine
+```
+
+See [polarengine-vllm](https://github.com/caiovicentino/polarengine-vllm) for full documentation.
+
+## Inference Speed (torchao path)
+
+EOQ models can also be loaded with **torchao** for fast quantized inference:
 
 ```
 Download (4.93 GB EOQ) → Dequantize → torchao INT4 → 43 tok/s, 6.3 GB VRAM
@@ -130,6 +159,7 @@ quantize_(model, Int4WeightOnlyConfig(group_size=128))
 | Qwen3.5-9B EOQ Dynamic BitPacked | [Dynamic](https://huggingface.co/caiovicentino1/Qwen3.5-9B-EOQ-Dynamic-BitPacked) |
 | Qwen3.5-9B EOQ v2 (AWQ) | [v2](https://huggingface.co/caiovicentino1/Qwen3.5-9B-EOQ-v2) |
 | Qwen3.5-9B EOQ v3 (PolarQuant+AWQ) | [v3](https://huggingface.co/caiovicentino1/Qwen3.5-9B-EOQ-v3) |
+| Qwen3.5-9B PolarEngine v4 | [PolarEngine](https://huggingface.co/caiovicentino1/Qwen3.5-9B-PolarEngine-v4) |
 
 ## Usage
 
@@ -172,9 +202,10 @@ dct-quantization/
 │   ├── svd_hybrid.py  # W = Q + LR for sub-2.5 bpw
 │   ├── quantized_linear.py  # INT4 packed nn.Module (47/47 tests)
 │   └── weight_loader.py     # Universal HuggingFace loader
-├── kernels/           # 16 CUDA kernel optimization variants
+├── kernels/           # 16 CUDA kernel variants + PolarEngine
 │   ├── k01-k16        # Shared memory, half2, uint4, multi-row, etc.
-│   └── k05_combined.py # Ultimate kernel (all optimizations)
+│   ├── k05_combined.py # Ultimate kernel (all optimizations)
+│   └── polar_engine.py # PolarQuant inference kernel (Triton + torch)
 ├── llamacpp/          # C rANS decoder + GGUF converter
 │   ├── eoq_rans.c     # C decoder (31/31 tests, 120 MB/s)
 │   ├── eoq_ggml.h     # GGML integration header
