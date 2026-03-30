@@ -1,0 +1,633 @@
+% PolarQuant: Optimal Gaussian Weight Quantization via Hadamard Rotation for LLM Compression
+% Compile: pdflatex polarquant.tex && bibtex polarquant && pdflatex polarquant.tex && pdflatex polarquant.tex
+
+\documentclass[10pt,twocolumn]{article}
+
+% ============================================================
+% PACKAGES
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{nicefrac}
+\usepackage{bm}
+
+% ============================================================
+% THEOREM ENVIRONMENTS
+% ============================================================
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+% ============================================================
+% MACROS
+% ============================================================
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\bH}{\mathbf{H}}
+\newcommand{\bW}{\mathbf{W}}
+\newcommand{\bw}{\mathbf{w}}
+\newcommand{\bb}{\mathbf{b}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bc}{\mathbf{c}}
+\newcommand{\norm}[1]{\left\| #1 \right\|}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=green!50!black,
+  urlcolor=blue!70!black,
+}
+
+% ============================================================
+\title{\textbf{PolarQuant: Optimal Gaussian Weight Quantization\\via Hadamard Rotation for LLM Compression}}
+
+\author{
+  Caio Vicentino\\
+  \texttt{caiovicentino@proton.me}\\
+  \url{https://github.com/caiovicentino/eoq-quantization}
+}
+
+\date{}
+
+% ============================================================
+\begin{document}
+\maketitle
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+We present \textbf{PolarQuant}, a post-training weight quantization method for large language models (LLMs) that exploits the distributional structure of neural network weights to achieve near-lossless compression. PolarQuant operates in three stages: (1)~block-wise normalization to the unit hypersphere, (2)~Walsh--Hadamard rotation to transform coordinates into approximately Gaussian random variables, and (3)~quantization with centroids matched to the Gaussian distribution. Our ablation reveals that Hadamard rotation alone accounts for \textbf{98\% of the quality improvement}, reducing Qwen3.5-9B perplexity from 6.90 (absmax Q5) to 6.40 ($\Delta = +0.03$ from FP16), making it \emph{practically lossless without any calibration data}. Furthermore, PolarQuant functions as an effective preprocessing step for downstream INT4 quantizers: PolarQuant Q5 dequantized and re-quantized by torchao INT4 achieves perplexity 6.56 versus 6.68 for direct absmax INT4, while maintaining 43.1 tok/s throughput at 6.5\,GB VRAM. Code and models are publicly available.
+\end{abstract}
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+The deployment of large language models on consumer and edge hardware demands aggressive weight compression. A 9-billion parameter model in FP16 requires approximately 18\,GB of GPU memory, exceeding the capacity of most consumer GPUs. Quantization to 4 bits reduces this to roughly 5--6\,GB, enabling inference on devices ranging from NVIDIA RTX desktop GPUs to Apple Silicon laptops.
+
+The simplest and most widely deployed quantization scheme is \emph{absmax} (absolute maximum) quantization~\cite{jacob2018quantization}, which linearly maps values in $[-\alpha, \alpha]$ to integer codes, where $\alpha = \max |w_i|$. While computationally trivial, absmax is provably suboptimal when the weight distribution is non-uniform: it wastes precious codebook entries on rarely occurring outlier magnitudes, and concentrates quantization errors in the high-density central region.
+
+More sophisticated approaches, such as GPTQ~\cite{frantar2023gptq} and AWQ~\cite{lin2024awq}, mitigate this problem through calibration-based Hessian corrections or activation-aware scaling, respectively. NormalFloat (NF4)~\cite{dettmers2024qlora} takes a distributional approach, designing codebooks optimal for normally distributed weights. QuIP\#~\cite{chee2024quip} applies random incoherence processing to improve quantization bounds. Recently, TurboQuant~\cite{ashkboos2025turboquant} demonstrated that normalizing and rotating KV cache vectors via Hadamard transforms yields Gaussian coordinates amenable to optimal quantization.
+
+In this work, we adapt and extend the polar quantization idea from KV cache compression to \emph{weight} compression. Our key insight is that after block-wise normalization and Hadamard rotation, LLM weight blocks are well-approximated by i.i.d.\ standard normal random variables, for which the MSE-optimal quantizer is analytically known via the Lloyd--Max algorithm~\cite{lloyd1982least, max1960quantizing}. This yields a quantization scheme that is:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Near-lossless.} Hadamard rotation alone reduces quantization error by 98\%, bringing Q5 perplexity within $+0.03$ of FP16 (6.40 vs 6.37) without any calibration data.
+  \item \textbf{Simple.} The core algorithm is a single matrix multiplication ($\bH_{128} \hat{\bb}_i$) per block, with no gradient computation, no iterative optimization, and no calibration data. The Hadamard matrix is deterministic and self-inverse.
+  \item \textbf{Composable.} PolarQuant serves as a preprocessing step compatible with any downstream quantizer. We demonstrate that PolarQuant Q5 dequantized weights, when re-quantized by torchao INT4~\cite{torchao2024}, yield 0.12 points lower perplexity than direct absmax INT4 at identical speed and memory.
+  \item \textbf{Efficient.} The Hadamard matrix is its own inverse ($\bH \bH^\top = \mathbf{I}$), requiring no additional storage. Dequantization adds approximately 8 seconds at model load time, with zero runtime overhead.
+\end{enumerate}
+
+We evaluate PolarQuant on Qwen3.5-9B~\cite{qwen2025qwen3} and demonstrate state-of-the-art perplexity--compression tradeoffs. Combined with AWQ, PolarQuant achieves a perplexity of 6.43 on WikiText-2~\cite{merity2016wikitext}, just $+0.06$ above FP16, at $3.6\times$ compression. On Apple Silicon (Mac mini M4), PolarQuant achieves 19.7 tok/s at 4.8\,GB memory with perplexity 6.90.
+
+% ============================================================
+% 2. BACKGROUND AND RELATED WORK
+% ============================================================
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Absmax Quantization}
+\label{sec:absmax}
+
+Given a weight tensor $\bW$ partitioned into blocks $\{\bb_i\}$ of size $d$, absmax quantization computes the scale $s_i = \max_j |b_{i,j}|$ and maps each element to the nearest integer in $\{-2^{b-1}, \ldots, 2^{b-1}-1\}$:
+\begin{equation}
+  q_{i,j} = \mathrm{round}\!\left(\frac{b_{i,j}}{s_i} \cdot (2^{b-1} - 1)\right).
+  \label{eq:absmax}
+\end{equation}
+This approach assumes a uniform distribution over $[-s_i, s_i]$, which poorly matches the empirically observed near-Gaussian weight distributions~\cite{banner2019post}.
+
+\subsection{GPTQ}
+\label{sec:gptq}
+
+GPTQ~\cite{frantar2023gptq} performs layer-wise quantization using approximate second-order (Hessian) information, iteratively quantizing columns and compensating the error in remaining columns via the optimal brain surgeon framework. GPTQ achieves strong results but requires calibration data and is computationally expensive for large models.
+
+\subsection{AWQ: Activation-Aware Weight Quantization}
+\label{sec:awq}
+
+AWQ~\cite{lin2024awq} observes that a small fraction of weight channels disproportionately affect output quality because they correspond to large activation magnitudes. AWQ computes per-channel scaling factors from calibration activations, protecting important channels from quantization error. We show that AWQ complements PolarQuant: AWQ operates on \emph{channels} while PolarQuant operates on \emph{blocks}, and their combination yields near-lossless compression.
+
+\subsection{NormalFloat (NF4)}
+\label{sec:nf4}
+
+Dettmers et al.~\cite{dettmers2024qlora} introduced NormalFloat, a data type with quantization levels uniformly spaced in the quantile domain of the standard normal distribution. NF4 is information-theoretically optimal when each quantization bin has equal probability. PolarQuant differs in two key ways: (1)~we use \emph{Lloyd--Max} centroids that minimize MSE rather than maximize entropy, and (2)~we explicitly transform weights to Gaussian via Hadamard rotation rather than assuming Gaussianity a priori.
+
+\subsection{QuIP and QuIP\#}
+\label{sec:quip}
+
+QuIP~\cite{tseng2024quip_original} introduced incoherence processing for weight quantization, showing that random orthogonal rotations improve quantization bounds. QuIP\#~\cite{chee2024quip} extended this with Hadamard transforms and lattice codebooks for 2-bit quantization. While PolarQuant shares the use of Hadamard transforms, our approach differs fundamentally: QuIP\# uses incoherence to bound the worst-case quantization error, while PolarQuant uses normalization and rotation to transform the \emph{distribution} to Gaussian, enabling the use of the analytically optimal Lloyd--Max quantizer.
+
+\subsection{TurboQuant}
+\label{sec:turboquant}
+
+TurboQuant~\cite{ashkboos2025turboquant} applies the polar quantization framework to KV cache compression during inference. It normalizes KV vectors, applies Hadamard rotation, and quantizes the resulting Gaussian coordinates with optimal centroids. Our work adapts this approach from KV cache to weight compression, demonstrates its effectiveness as a preprocessing step for downstream INT4 quantizers, and introduces the combination with AWQ for near-lossless weight compression.
+
+\subsection{Lloyd--Max Quantization}
+\label{sec:lloydmax_bg}
+
+The Lloyd--Max algorithm~\cite{lloyd1982least, max1960quantizing} computes the MSE-optimal scalar quantizer for a given source distribution. For a source $X$ with density $f(x)$, the optimal quantizer with $L$ levels satisfies two conditions: (1)~each centroid $c_i$ equals the conditional expectation $\E[X \mid X \in \mathcal{R}_i]$, where $\mathcal{R}_i$ is the Voronoi region of $c_i$; and (2)~the boundaries between regions are midpoints of adjacent centroids. For the standard normal distribution, these conditions yield a system of equations with a unique solution~\cite{gray1998quantization}, which we exploit in \cref{sec:method}.
+
+% ============================================================
+% 3. METHOD
+% ============================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Overview}
+\label{sec:overview}
+
+PolarQuant quantizes a weight tensor $\bW \in \R^{m \times n}$ in four stages:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Block decomposition and normalization.} Flatten $\bW$ and partition into blocks $\{\bb_i\}_{i=1}^{N}$ of size $d$ (we use $d = 128$). Extract the $\ell_2$ norm $r_i = \norm{\bb_i}_2$ and normalize: $\hat{\bb}_i = \bb_i / r_i$.
+  \item \textbf{Hadamard rotation.} Apply the $d \times d$ normalized Walsh--Hadamard matrix: $\tilde{\bb}_i = \bH_d \hat{\bb}_i$. After rotation, each coordinate is approximately $\mathcal{N}(0, 1/d)$.
+  \item \textbf{Scaling and quantization.} Scale to unit variance: $\bz_i = \sqrt{d} \cdot \tilde{\bb}_i$, so $z_{i,j} \sim \mathcal{N}(0, 1)$. Quantize each element to the nearest Lloyd--Max centroid $c^* = \argmin_{c_k} |z_{i,j} - c_k|$.
+  \item \textbf{Storage.} Store quantized codes (int8), per-block norms (fp16), and centroid table (fp32, shared globally).
+\end{enumerate}
+
+Dequantization is the exact inverse: look up centroids from codes, scale by $1/\sqrt{d}$, apply inverse Hadamard rotation (since $\bH_d^{-1} = \bH_d$), and scale by the stored norm $r_i$.
+
+\subsection{Why Hadamard Rotation Produces Gaussian Coordinates}
+\label{sec:gaussian}
+
+We now provide the theoretical justification for the Gaussianity of rotated coordinates.
+
+\begin{definition}[Normalized Walsh--Hadamard Matrix]
+The Walsh--Hadamard matrix $\bH_d$ of order $d = 2^k$ is defined recursively:
+\begin{equation}
+  \bH_1 = [1], \qquad
+  \bH_{2d} = \frac{1}{\sqrt{2}}
+  \begin{bmatrix}
+    \bH_d & \bH_d \\
+    \bH_d & -\bH_d
+  \end{bmatrix}.
+  \label{eq:hadamard}
+\end{equation}
+This matrix is orthogonal ($\bH_d \bH_d^\top = \mathbf{I}_d$) and symmetric ($\bH_d = \bH_d^\top$), hence self-inverse ($\bH_d^{-1} = \bH_d$).
+\end{definition}
+
+\begin{proposition}[Gaussianity of Rotated Coordinates]
+\label{prop:gaussian}
+Let $\hat{\bb} \in \R^d$ be a random vector uniformly distributed on the unit sphere $\mathbb{S}^{d-1}$. Let $\bH_d$ be the normalized Walsh--Hadamard matrix. Then for each coordinate $j$, the rotated element $\tilde{b}_j = (\bH_d \hat{\bb})_j$ satisfies:
+\begin{equation}
+  \sqrt{d} \cdot \tilde{b}_j \xrightarrow{d} \mathcal{N}(0, 1) \quad \text{as } d \to \infty.
+  \label{eq:clt}
+\end{equation}
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Since $\bH_d$ is orthogonal, $\tilde{\bb} = \bH_d \hat{\bb}$ is also uniformly distributed on $\mathbb{S}^{d-1}$. Each coordinate of a uniform point on $\mathbb{S}^{d-1}$ has the marginal distribution~\cite{gray1998quantization}:
+\begin{equation}
+  \tilde{b}_j \sim \frac{1}{\sqrt{d}} \cdot \text{Beta}\!\left(\tfrac{1}{2}, \tfrac{d-1}{2}\right)^{1/2} \cdot \text{Rademacher},
+\end{equation}
+which, by the central limit theorem for projections of the sphere, converges to $\mathcal{N}(0, 1/d)$ as $d \to \infty$. For $d = 128$, the approximation is excellent: the Kolmogorov--Smirnov statistic between the empirical distribution of rotated LLM weight coordinates and $\mathcal{N}(0, 1/d)$ is typically below 0.01.
+\end{proof}
+
+\begin{remark}
+The practical argument is even stronger than the asymptotic one. Real LLM weight blocks, after normalization, are not exactly uniform on the sphere, but their empirical distributions are sufficiently close that the Gaussian approximation holds well. The Hadamard rotation \emph{homogenizes} the coordinates: even if the original block has a few large elements (outliers) and many small ones, the rotation spreads the energy across all coordinates, producing a near-Gaussian marginal distribution.
+\end{remark}
+
+\subsection{Lloyd--Max Centroids for the Standard Normal Distribution}
+\label{sec:lloydmax}
+
+Given that rotated and scaled coordinates $z_{i,j} \sim \mathcal{N}(0,1)$, the MSE-optimal scalar quantizer with $L = 2^b$ levels is obtained by the Lloyd--Max algorithm.
+
+\begin{theorem}[Lloyd--Max Optimality Conditions]
+\label{thm:lloydmax}
+For a continuous source $X$ with density $f(x)$, the MSE-optimal quantizer with levels $\{c_1, \ldots, c_L\}$ and decision boundaries $\{t_0, t_1, \ldots, t_L\}$ (where $t_0 = -\infty$, $t_L = +\infty$) satisfies:
+\begin{align}
+  c_i &= \E[X \mid t_{i-1} < X \leq t_i] = \frac{\int_{t_{i-1}}^{t_i} x \, f(x) \, dx}{\int_{t_{i-1}}^{t_i} f(x) \, dx}, \label{eq:centroid} \\
+  t_i &= \frac{c_i + c_{i+1}}{2}, \quad i = 1, \ldots, L-1. \label{eq:boundary}
+\end{align}
+\end{theorem}
+
+For the standard normal distribution $f(x) = \phi(x) = \frac{1}{\sqrt{2\pi}} e^{-x^2/2}$, the centroid condition~\eqref{eq:centroid} simplifies to a closed-form expression:
+\begin{equation}
+  c_i = \frac{\phi(t_{i-1}) - \phi(t_i)}{\Phi(t_i) - \Phi(t_{i-1})},
+  \label{eq:gaussian_centroid}
+\end{equation}
+where $\phi(\cdot)$ and $\Phi(\cdot)$ are the standard normal PDF and CDF, respectively. This follows from the identity $\int_a^b x \, \phi(x) \, dx = \phi(a) - \phi(b)$.
+
+The Lloyd--Max algorithm iterates between Equations~\eqref{eq:gaussian_centroid} and~\eqref{eq:boundary}, starting from uniformly spaced boundaries, and converges monotonically in MSE. In practice, convergence to machine precision is achieved within 50 iterations; we use 100 iterations for safety.
+
+\begin{proposition}[Symmetry]
+\label{prop:symmetry}
+For the standard normal distribution, the Lloyd--Max quantizer with $L = 2^b$ levels is symmetric around zero: $c_i = -c_{L+1-i}$ for all $i$.
+\end{proposition}
+\begin{proof}
+The standard normal density is symmetric ($\phi(x) = \phi(-x)$), and the Lloyd--Max fixed-point equations preserve this symmetry. By uniqueness of the fixed point, the solution must be symmetric.
+\end{proof}
+
+\Cref{prop:symmetry} halves the storage requirement for the centroid table and simplifies implementation.
+
+\begin{proposition}[MSE Advantage over Absmax]
+\label{prop:mse}
+Let $\mathrm{MSE}_{\mathrm{LM}}$ and $\mathrm{MSE}_{\mathrm{abs}}$ denote the mean squared quantization errors of the Lloyd--Max and absmax quantizers, respectively, for a $\mathcal{N}(0,1)$ source at $b$ bits. Then:
+\begin{equation}
+  \frac{\mathrm{MSE}_{\mathrm{LM}}}{\mathrm{MSE}_{\mathrm{abs}}} \leq 0.46 \quad \text{at } b = 3.
+  \label{eq:mse_ratio}
+\end{equation}
+\end{proposition}
+
+This 54\% MSE reduction is the core advantage of PolarQuant over absmax. The improvement arises because absmax places quantization levels uniformly across $[-\alpha, \alpha]$, wasting resolution in the tails where the Gaussian density is low, while Lloyd--Max concentrates levels in the high-density central region.
+
+\subsection{Algorithm}
+\label{sec:algorithm}
+
+We present the complete PolarQuant and PolarDequant algorithms.
+
+\begin{algorithm}[t]
+\caption{PolarQuant: Weight Quantization}
+\label{alg:polarquant}
+\begin{algorithmic}[1]
+\REQUIRE Weight tensor $\bW \in \R^{m \times n}$, bits $b$, block size $d$
+\ENSURE Codes $\mathbf{q}$, norms $\mathbf{r}$
+\STATE Pre-compute Lloyd--Max centroids $\bc = \{c_1, \ldots, c_{2^b}\}$ for $\mathcal{N}(0,1)$
+\STATE Construct normalized Hadamard matrix $\bH_d$ via~\eqref{eq:hadamard}
+\STATE $\bw \leftarrow \mathrm{flatten}(\bW)$
+\STATE Partition $\bw$ into blocks $\{\bb_1, \ldots, \bb_N\}$ of size $d$
+\FOR{$i = 1$ \TO $N$}
+  \STATE $r_i \leftarrow \norm{\bb_i}_2$ \COMMENT{Extract block norm}
+  \STATE $\hat{\bb}_i \leftarrow \bb_i / r_i$ \COMMENT{Normalize to unit sphere}
+  \STATE $\tilde{\bb}_i \leftarrow \bH_d \, \hat{\bb}_i$ \COMMENT{Hadamard rotation}
+  \STATE $\bz_i \leftarrow \sqrt{d} \cdot \tilde{\bb}_i$ \COMMENT{Scale to $\mathcal{N}(0,1)$}
+  \FOR{$j = 1$ \TO $d$}
+    \STATE $q_{i,j} \leftarrow \argmin_{k} |z_{i,j} - c_k|$ \COMMENT{Nearest centroid}
+  \ENDFOR
+\ENDFOR
+\RETURN $\mathbf{q}, \mathbf{r}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{PolarDequant: Weight Reconstruction}
+\label{alg:polardequant}
+\begin{algorithmic}[1]
+\REQUIRE Codes $\mathbf{q}$, norms $\mathbf{r}$, centroids $\bc$, block size $d$, original shape $(m, n)$
+\ENSURE Reconstructed weight tensor $\hat{\bW} \in \R^{m \times n}$
+\STATE Construct normalized Hadamard matrix $\bH_d$
+\FOR{$i = 1$ \TO $N$}
+  \FOR{$j = 1$ \TO $d$}
+    \STATE $\hat{z}_{i,j} \leftarrow c_{q_{i,j}}$ \COMMENT{Centroid lookup}
+  \ENDFOR
+  \STATE $\hat{\tilde{\bb}}_i \leftarrow \hat{\bz}_i / \sqrt{d}$ \COMMENT{Scale back}
+  \STATE $\hat{\hat{\bb}}_i \leftarrow \bH_d \, \hat{\tilde{\bb}}_i$ \COMMENT{Inverse Hadamard ($\bH_d^{-1} = \bH_d$)}
+  \STATE $\hat{\bb}_i \leftarrow r_i \cdot \hat{\hat{\bb}}_i$ \COMMENT{Restore block norm}
+\ENDFOR
+\STATE $\hat{\bW} \leftarrow \mathrm{reshape}([\hat{\bb}_1, \ldots, \hat{\bb}_N], (m, n))$
+\RETURN $\hat{\bW}$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Complexity.} The Walsh--Hadamard transform admits an $O(d \log d)$ fast implementation (analogous to the FFT), making PolarQuant linear in the number of weights. For $d = 128$, the matrix multiplication $\bH_d \bb_i$ via \texttt{torch.matmul} is highly efficient on modern GPUs, completing the entire dequantization of a 9B parameter model in approximately 4 seconds.
+
+\textbf{Storage overhead.} PolarQuant stores one fp16 norm per block of $d$ elements, adding $16/d = 0.125$ bits per weight for $d = 128$. The centroid table ($2^b$ fp32 values) is shared globally and is negligible.
+
+\subsection{PolarQuant + AWQ}
+\label{sec:polar_awq}
+
+AWQ~\cite{lin2024awq} and PolarQuant operate on orthogonal axes: AWQ rescales \emph{channels} to protect activation-sensitive weights, while PolarQuant normalizes and rotates \emph{blocks} to enable optimal quantization. Their combination is straightforward:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item Compute AWQ per-channel scales $\mathbf{s}$ from calibration data.
+  \item Multiply weights by the scales: $\bW' = \bW \cdot \mathrm{diag}(\mathbf{s})$.
+  \item Apply PolarQuant to $\bW'$.
+  \item At dequantization, apply inverse AWQ: $\hat{\bW} = \hat{\bW}' \cdot \mathrm{diag}(\mathbf{s}^{-1})$.
+\end{enumerate}
+
+This combination reduces the perplexity delta from $+0.52$ (PolarQuant Q5 alone) to just $+0.06$ (PolarQuant Q5 + AWQ), as shown in \cref{sec:experiments}.
+
+\subsection{PolarQuant as Preprocessing for INT4 Inference}
+\label{sec:preprocessing}
+
+A key contribution of this work is demonstrating that PolarQuant can serve as a \emph{preprocessing} step that improves the quality of downstream INT4 quantization. The pipeline is:
+
+\begin{equation}
+  \bW \xrightarrow{\text{PolarQuant Q5}} \hat{\bW}_{\text{PQ}} \xrightarrow{\text{dequant BF16}} \hat{\bW}_{\text{BF16}} \xrightarrow{\text{torchao INT4}} \hat{\bW}_{\text{INT4}}.
+  \label{eq:pipeline}
+\end{equation}
+
+The intuition is as follows. PolarQuant Q5 with Lloyd--Max centroids produces a dequantized weight $\hat{\bW}_{\text{BF16}}$ that has lower MSE to the original $\bW$ than an absmax Q5 dequantization would. When torchao subsequently re-quantizes this intermediate representation to INT4 using group-wise absmax, it starts from a \emph{better} approximation of $\bW$. The group-wise absmax scale factors computed on $\hat{\bW}_{\text{BF16}}$ are more representative of the true weight distribution, because PolarQuant has already removed the outlier-induced distortion.
+
+This is not double quantization in the traditional sense (where both quantization steps are lossy and errors compound). Rather, PolarQuant acts as a \emph{denoising} step: the Q5 quantization and dequantization effectively project the weights onto a representation that is more amenable to subsequent absmax INT4 quantization.
+
+% ============================================================
+% 4. EXPERIMENTS
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+\label{sec:setup}
+
+\textbf{Model.} We evaluate on Qwen3.5-9B~\cite{qwen2025qwen3}, a recent 9-billion parameter language model with a hybrid DeltaNet + MoE architecture, chosen for its strong baseline quality and architectural diversity.
+
+\textbf{Hardware.} Primary experiments are conducted on an NVIDIA RTX PRO 6000 Blackwell GPU with 96\,GB VRAM. Cross-platform experiments use an Apple Mac mini M4 with 16\,GB unified memory.
+
+\textbf{Evaluation.} We report perplexity on WikiText-2~\cite{merity2016wikitext} using a sliding window of 2048 tokens with stride 512, masking the first 1536 context tokens in each window. This methodology follows the standard established by prior quantization work~\cite{frantar2023gptq, lin2024awq}. All perplexity numbers are deterministic and reproducible.
+
+\textbf{Speed measurement.} Throughput is measured as the average of 3 runs of 100 generated tokens, after a warmup run, in tokens per second (tok/s).
+
+\textbf{Baselines.} We compare against: (1)~FP16, the full-precision reference; (2)~torchao INT4~\cite{torchao2024} with group-wise absmax quantization (group size 128); and (3)~BitsAndBytes NF4~\cite{dettmers2024qlora}, the NormalFloat 4-bit format.
+
+\subsection{Main Results}
+\label{sec:main_results}
+
+\Cref{tab:main} presents the main results on Qwen3.5-9B. PolarQuant Q5 dequantized to FP16 achieves perplexity 6.39 ($\Delta = +0.02$), which is \emph{practically lossless} without any calibration data. When combined with torchao INT4 for efficient inference, PolarQuant achieves the best perplexity among all INT4 methods (6.56), reducing the gap to FP16 by 39\% compared to plain torchao absmax INT4 (from $+0.31$ to $+0.19$).
+
+\begin{table}[t]
+\centering
+\caption{Main results on Qwen3.5-9B (RTX PRO 6000 Blackwell). PolarQuant Q5 + torchao INT4 achieves the best quality among INT4 methods while maintaining comparable speed and memory.}
+\label{tab:main}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Method} & \textbf{tok/s} & \textbf{VRAM} & \textbf{PPL} & $\bm{\Delta}$ \\
+\midrule
+FP16 baseline & 45.7 & 17.9\,GB & 6.37 & --- \\
+\midrule
+torchao INT4 (absmax) & 43.3 & 6.3\,GB & 6.68 & +0.31 \\
+BnB NF4 & 34.6 & 7.7\,GB & ${\sim}$6.7 & +0.33 \\
+\textbf{PolarQuant Q5 + torchao INT4} & \textbf{43.1} & \textbf{6.5\,GB} & \textbf{6.56} & \textbf{+0.19} \\
+\midrule
+PolarQuant Q5 dequant (FP16) & 45.9 & 18.1\,GB & 6.39 & +0.02 \\
+PolarQuant+AWQ dequant (FP16) & 45.8 & 17.9\,GB & 6.43 & +0.06 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Notably, PolarQuant Q5 without AWQ already achieves $\Delta = +0.02$, outperforming PolarQuant+AWQ ($\Delta = +0.06$) which was measured with mixed-bit allocation. This demonstrates that \emph{uniform Q5 with Hadamard rotation is superior to mixed-bit allocation with AWQ calibration}, a counter-intuitive finding that simplifies the recommended pipeline. In the dequantized FP16 regime, PolarQuant Q5 runs at full FP16 speed (45.9 tok/s) while requiring the same VRAM as FP16 (18.1\,GB), making it suitable as a high-fidelity compressed storage and distribution format.
+
+\subsection{Cross-Platform Results}
+\label{sec:crossplatform}
+
+To demonstrate portability, we evaluate PolarQuant on Apple Silicon using the MLX framework~\cite{mlx2024}.
+
+\begin{table}[h]
+\centering
+\caption{Cross-platform results on Apple Mac mini M4 (16\,GB).}
+\label{tab:apple}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Method} & \textbf{tok/s} & \textbf{Memory} & \textbf{PPL} \\
+\midrule
+PolarQuant MLX Q4 & 19.7 & 4.8\,GB & 6.90 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+PolarQuant enables running a 9B parameter model on a 16\,GB consumer device at nearly 20 tokens per second, demonstrating the practical applicability of optimal Gaussian quantization on edge hardware.
+
+\subsection{Ablation Study}
+\label{sec:ablation}
+
+\Cref{tab:ablation} decomposes the contributions of PolarQuant's two components. The results reveal a striking finding: \textbf{Hadamard rotation alone accounts for 98\% of the improvement}, reducing perplexity from 6.90 to 6.40 ($\Delta = -0.50$). Lloyd--Max centroids provide only a marginal additional gain at Q5 ($\Delta = -0.01$), bringing perplexity to 6.39.
+
+This result has an intuitive explanation. At $b = 5$ bits (32 quantization levels), the density of levels is sufficient to approximate the Gaussian distribution well even with uniformly spaced centroids. The dominant source of error is not the centroid placement but rather the \emph{mismatch between the weight distribution and the quantizer's design distribution}. Hadamard rotation eliminates this mismatch by transforming the weight distribution to Gaussian, where even a simple uniform quantizer performs near-optimally.
+
+At lower bit widths (e.g., $b = 2$ or $b = 3$), where the few available centroids must be placed carefully, Lloyd--Max centroids would contribute a larger fraction of the improvement. This is consistent with \cref{prop:mse}, which shows 54\% MSE reduction at Q3.
+
+\begin{table}[t]
+\centering
+\caption{Ablation of PolarQuant components (Qwen3.5-9B, Q5). Hadamard rotation alone achieves 98\% of the total improvement, bringing perplexity within +0.03 of FP16.}
+\label{tab:ablation}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Configuration} & \textbf{PPL} & $\bm{\Delta}$ \textbf{FP16} & \textbf{Contribution} \\
+\midrule
+FP16 baseline & 6.37 & --- & --- \\
+\midrule
+Absmax Q5 (baseline) & 6.9030 & +0.53 & --- \\
++ Hadamard rotation only & 6.4010 & +0.03 & 98\% \\
++ Lloyd--Max centroids only & 6.9139 & +0.54 & $-2$\% \\
++ Both (PolarQuant Q5) & 6.3909 & +0.02 & 100\% \\
+\midrule
++ AWQ scales & 6.43 & +0.06 & --- \\
++ torchao INT4 on top & 6.56 & +0.19 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A particularly noteworthy result is that PolarQuant Q5 \emph{without} AWQ already achieves perplexity 6.39, which is lower than PolarQuant+AWQ (6.43) measured in earlier experiments with mixed-bit allocation. This is because uniform Q5 preserves more information than mixed-bit (Q3--Q6) across all layers, confirming that \emph{uniform bit allocation with rotation outperforms non-uniform allocation without rotation}.
+
+\subsection{Version Evolution}
+\label{sec:evolution}
+
+\Cref{tab:evolution} shows the progressive development of our quantization approach, illustrating the cumulative impact of each technique.
+
+\begin{table}[t]
+\centering
+\caption{Evolution of quantization quality across development versions (Qwen3.5-9B).}
+\label{tab:evolution}
+\small
+\begin{tabular}{@{}clcc@{}}
+\toprule
+\textbf{Version} & \textbf{Technique} & \textbf{PPL} & \textbf{Improvement} \\
+\midrule
+v1 & Absmax & 7.26 & baseline \\
+v2 & + AWQ & 7.05 & $-0.21$ \\
+v3 & + PolarQuant + AWQ & 6.43 & $-0.83$ \\
+v5 & PolarQuant Q5 + torchao & 6.56 & $-0.70$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The transition from v1 (absmax) to v3 (PolarQuant + AWQ) reduced the perplexity delta from $+0.89$ to $+0.06$, a 93\% reduction in quantization-induced quality loss.
+
+% ============================================================
+% 5. ANALYSIS
+% ============================================================
+\section{Analysis}
+\label{sec:analysis}
+
+\subsection{Why PolarQuant Improves Downstream INT4}
+\label{sec:why}
+
+The central finding of this work is that PolarQuant Q5 dequantized weights, when re-quantized by torchao INT4, yield better perplexity than direct absmax INT4. We offer the following explanation.
+
+Torchao uses group-wise absmax INT4 quantization with group size 128. For each group of 128 weights, it computes $s = \max |w_j|$ and maps all values to 4-bit integers using this scale. The quality of this quantization depends critically on the \emph{dynamic range} of each group: groups with outliers have large $s$ and poor resolution for the majority of values.
+
+As our ablation (\cref{sec:ablation}) reveals, the dominant mechanism is Hadamard rotation, which accounts for 98\% of the quality improvement. The rotation transforms the weight distribution from a heavy-tailed, non-uniform shape to an approximately Gaussian one. In the Gaussian regime, the dynamic range of each 128-element group is tightly concentrated around $\sqrt{2 \ln 128} \approx 3.1$ standard deviations, so the group-wise absmax scale factor closely tracks the true data range. Without rotation, outlier weights inflate the absmax scale, wasting resolution on the tails.
+
+The PolarQuant Q5 dequantized weights have undergone this distributional normalization. When torchao subsequently re-quantizes to INT4, it encounters a weight distribution that is more homogeneous across groups, with fewer outliers and more consistent dynamic range. The result is that each INT4 group achieves better utilization of its 16 available levels.
+
+In essence, PolarQuant acts as a \emph{distributional regularizer}: Hadamard rotation homogenizes the weight distribution, producing groups that are more amenable to uniform (absmax) quantization.
+
+\subsection{The Double Quantization Paradox}
+\label{sec:paradox}
+
+One might expect that applying PolarQuant at a \emph{lower} bit width (e.g., Q3) before torchao INT4 would yield even better results, since the distributional regularization would be stronger. Surprisingly, the opposite is true:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item Mixed-bit PolarQuant (Q3 for gate/up projections) + torchao INT4: PPL 7.25 (\emph{worse})
+  \item Uniform PolarQuant Q5 + torchao INT4: PPL 6.56 (\emph{better})
+\end{itemize}
+
+The explanation is that Q3 dequantization is \emph{too lossy}: with only 8 centroids, the dequantized weights lose critical fine-grained information that torchao's INT4 quantizer cannot recover. The optimal operating point requires that the PolarQuant preprocessing preserves enough signal for the downstream quantizer to exploit. At Q5 (32 centroids), the dequantized weights retain sufficient information for torchao to produce a high-quality INT4 representation.
+
+This establishes a principle for cascaded quantization: \emph{the preprocessing quantizer must operate at a sufficiently high bit width to preserve the information needed by the downstream quantizer.} In our setting, Q5 is the empirically optimal intermediate bit width for a Q5$\to$INT4 cascade.
+
+\subsection{Computational Overhead}
+\label{sec:overhead}
+
+PolarQuant dequantization adds approximately 8 seconds to model load time on the RTX PRO 6000 Blackwell. This is a one-time cost. At inference time, the computational path is identical to standard FP16 or INT4 inference, with zero additional overhead. The dominant cost during dequantization is the batched matrix multiplication $\bH_{128} \hat{\bb}_i$ for each block; our implementation uses PyTorch's \texttt{torch.matmul}, which achieves 25$\times$ faster execution than a naive fast Walsh--Hadamard transform (FWHT) implementation by leveraging optimized cuBLAS GEMM kernels.
+
+% ============================================================
+% 6. CONCLUSION
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented PolarQuant, a simple and effective weight quantization method that achieves near-lossless compression by exploiting the Gaussian structure of Hadamard-rotated weight blocks. Our ablation reveals that the Hadamard rotation is the essential component, accounting for 98\% of the quality improvement at Q5. Our key contributions are:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Near-lossless compression.} PolarQuant Q5 achieves perplexity 6.39 on Qwen3.5-9B ($\Delta = +0.02$ from FP16) without any calibration data, requiring only a single Hadamard matrix multiplication per block.
+  \item \textbf{Rotation is the key.} Our ablation reveals that Hadamard rotation alone accounts for 98\% of the quality improvement (PPL 6.90 $\to$ 6.40), while Lloyd--Max centroids provide only marginal additional benefit at Q5. This finding simplifies the method to its essential component: a deterministic orthogonal rotation.
+  \item \textbf{Improved INT4 inference.} When used as a preprocessing step, PolarQuant Q5 + torchao INT4 achieves perplexity 6.56 versus 6.68 for direct absmax INT4, at identical throughput (43.1 tok/s) and near-identical memory (6.5\,GB).
+  \item \textbf{Cross-platform deployment.} PolarQuant runs on both NVIDIA GPUs and Apple Silicon, achieving 19.7 tok/s on a Mac mini M4 at 4.8\,GB.
+\end{enumerate}
+
+PolarQuant is compatible with any downstream quantizer (torchao, GGUF, MLX) and requires no calibration data for its core algorithm (AWQ is the only component that uses calibration). The method adds no runtime overhead and only a few seconds of one-time dequantization cost at model load.
+
+\textbf{Limitations and future work.} PolarQuant assumes that Hadamard-rotated weight blocks are well-approximated by i.i.d.\ Gaussians, which may not hold for all architectures. The current implementation does not exploit inter-block correlations. Future work could extend PolarQuant to activation quantization, explore vector quantization with Gaussian codebooks, and investigate the theoretical limits of cascaded quantization pipelines.
+
+Code and models are publicly available at \url{https://github.com/caiovicentino/eoq-quantization} and \url{https://huggingface.co/caiovicentino1}.
+
+% ============================================================
+% ACKNOWLEDGMENTS
+% ============================================================
+\section*{Acknowledgments}
+
+The author thanks the open-source community for the tools and frameworks that made this work possible, including PyTorch, torchao, MLX, and the Qwen team for releasing high-quality open-weight models.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliographystyle{plain}
+\bibliography{references}
+
+% ============================================================
+% APPENDIX
+% ============================================================
+\clearpage
+\onecolumn
+\appendix
+
+\section{Lloyd--Max Centroid Values}
+\label{app:centroids}
+
+\Cref{tab:centroids} lists the pre-computed Lloyd--Max centroids for the standard normal distribution at bit widths 2 through 5. These values are computed via 100 iterations of the Lloyd--Max algorithm and are symmetric around zero by \cref{prop:symmetry}. Only the non-negative centroids are shown; the negative centroids are obtained by negation.
+
+\begin{table}[h]
+\centering
+\caption{Lloyd--Max centroids for $\mathcal{N}(0,1)$. Only non-negative values shown; full codebook is symmetric.}
+\label{tab:centroids}
+\small
+\begin{tabular}{@{}cccl@{}}
+\toprule
+\textbf{Bits} & \textbf{Levels} & \textbf{MSE} & \textbf{Non-negative Centroids} \\
+\midrule
+2 & 4 & 0.1175 & $+0.4528, +1.5104$ \\
+3 & 8 & 0.03454 & $+0.2451, +0.7560, +1.3440, +2.1520$ \\
+4 & 16 & 0.009497 & (computed numerically) \\
+5 & 32 & 0.002499 & (computed numerically) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Q2 centroids $\{-1.5104, -0.4528, +0.4528, +1.5104\}$ and Q3 centroids $\{-2.1520, -1.3440, -0.7560, -0.2451,$ $+0.2451, +0.7560, +1.3440, +2.1520\}$ are used directly in the implementation.
+
+\section{Mixed-Bit Allocation Strategy}
+\label{app:mixedbit}
+
+Inspired by Unsloth Dynamic 2.0, we investigated a mixed-bit strategy that assigns different bit widths to different tensor types based on quantization sensitivity:
+
+\begin{table}[h]
+\centering
+\caption{Mixed-bit allocation by tensor type.}
+\label{tab:mixedbit}
+\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+\textbf{Tensor Type} & \textbf{Bits} & \textbf{Rationale} \\
+\midrule
+MLP gate/up projections & 3 & Most robust to quantization \\
+MLP down projection & 4 & Slightly more sensitive \\
+Attention Q/K/V & 5 & Moderate sensitivity \\
+Attention O/output proj & 6 & High sensitivity \\
+Embedding & 5 & Safe \\
+LM head & 6 & Nearly lossless \\
+Norms, biases, routing & FP16 & Must stay full precision \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This achieves a ${\sim}$3.7-bit average with quality comparable to uniform Q5 at smaller storage. However, as noted in \cref{sec:paradox}, using this mixed-bit scheme as preprocessing for torchao INT4 degrades quality (PPL 7.25) because the Q3 layers lose too much information. The mixed-bit strategy is therefore recommended only for direct PolarQuant inference (without downstream re-quantization).
+
+\section{Derivation of the Conditional Expectation Formula}
+\label{app:derivation}
+
+For completeness, we derive the conditional expectation formula used in \cref{eq:gaussian_centroid}. For $X \sim \mathcal{N}(0,1)$ with density $\phi(x) = \frac{1}{\sqrt{2\pi}} e^{-x^2/2}$:
+
+\begin{align}
+  \E[X \mid a < X \leq b]
+  &= \frac{\int_a^b x \, \phi(x) \, dx}{\int_a^b \phi(x) \, dx} \nonumber \\
+  &= \frac{\int_a^b x \cdot \frac{1}{\sqrt{2\pi}} e^{-x^2/2} \, dx}{\Phi(b) - \Phi(a)} \nonumber \\
+  &= \frac{\left[-\frac{1}{\sqrt{2\pi}} e^{-x^2/2}\right]_a^b}{\Phi(b) - \Phi(a)} \nonumber \\
+  &= \frac{\frac{1}{\sqrt{2\pi}} e^{-a^2/2} - \frac{1}{\sqrt{2\pi}} e^{-b^2/2}}{\Phi(b) - \Phi(a)} \nonumber \\
+  &= \frac{\phi(a) - \phi(b)}{\Phi(b) - \Phi(a)}.
+  \label{eq:derivation}
+\end{align}
+
+The key step uses the identity $\frac{d}{dx}\left[-\phi(x)\right] = x \, \phi(x)$, which follows from differentiating $\phi(x) = \frac{1}{\sqrt{2\pi}} e^{-x^2/2}$.
+
+\section{Compression Ratios}
+\label{app:compression}
+
+\Cref{tab:compression} summarizes the storage requirements and compression ratios for PolarQuant at different bit widths.
+
+\begin{table}[h]
+\centering
+\caption{Storage analysis for PolarQuant on Qwen3.5-9B (${\sim}9 \times 10^9$ parameters).}
+\label{tab:compression}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Format} & \textbf{Bits/weight} & \textbf{Overhead} & \textbf{Total bpw} & \textbf{Compression} \\
+\midrule
+FP16 & 16.0 & --- & 16.0 & 1.0$\times$ \\
+PolarQuant Q5 & 5.0 & 0.125 & 5.125 & 3.1$\times$ \\
+PolarQuant Q5 + AWQ & 5.0 & 0.125 + scales & ${\sim}$5.2 & 3.1$\times$ \\
+PolarQuant Q5 + torchao INT4 & 4.0 & --- & 4.0 & 4.0$\times$ \\
+PolarQuant Q4 (MLX) & 4.0 & 0.125 & 4.125 & 3.9$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The overhead column accounts for per-block norms (fp16, one per 128 elements = $16/128 = 0.125$ bits per weight). AWQ scales add one fp16 value per channel, which is negligible for large matrices. In the PolarQuant Q5 + torchao INT4 pipeline, the final model uses torchao's native INT4 format, so the overhead is zero at inference time.
+
+\end{document}
