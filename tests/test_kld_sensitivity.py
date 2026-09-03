@@ -105,8 +105,6 @@ def test_classify_tensor_other():
 
 
 # ── get_bit_allocation ──────────────────────────────────────────────────
-# The function does not exist yet.  Tests are written as a specification
-# and marked xfail so the suite stays green until it is implemented.
 
 def _import_get_bit_allocation():
     """Try to import get_bit_allocation; return None if missing."""
@@ -117,10 +115,6 @@ def _import_get_bit_allocation():
         return None
 
 
-@pytest.mark.xfail(
-    reason="get_bit_allocation not yet implemented in core.kld_sensitivity",
-    strict=True,
-)
 def test_get_bit_allocation_basic():
     get_bit_allocation = _import_get_bit_allocation()
     assert get_bit_allocation is not None, "get_bit_allocation not found"
@@ -133,10 +127,6 @@ def test_get_bit_allocation_basic():
     assert all(2 <= v <= 16 for v in alloc.values())
 
 
-@pytest.mark.xfail(
-    reason="get_bit_allocation not yet implemented in core.kld_sensitivity",
-    strict=True,
-)
 def test_get_bit_allocation_target():
     get_bit_allocation = _import_get_bit_allocation()
     assert get_bit_allocation is not None, "get_bit_allocation not found"

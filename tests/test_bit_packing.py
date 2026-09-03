@@ -39,10 +39,12 @@ def test_packed_size_q5():
 def test_single_element():
     from core.bit_packing import pack_codes, unpack_codes
     for bits in [3, 4, 5]:
-        codes = torch.tensor([5], dtype=torch.int8)
-        packed = pack_codes(codes, bits)
-        unpacked = unpack_codes(packed, bits, 1)
-        assert codes[0] == unpacked[0]
+        qmax = (1 << (bits - 1)) - 1
+        for value in [qmax, -qmax, 0]:
+            codes = torch.tensor([value], dtype=torch.int8)
+            packed = pack_codes(codes, bits)
+            unpacked = unpack_codes(packed, bits, 1)
+            assert codes[0] == unpacked[0]
 
 def test_odd_elements():
     from core.bit_packing import pack_codes, unpack_codes

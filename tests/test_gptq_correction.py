@@ -140,8 +140,9 @@ def test_gptq_scale_stored_in_result():
     W = torch.randn(64, 128)
     H = torch.eye(128)
     result = gptq_quantize_weight(W, H, bits=4, block_size=128)
-    assert hasattr(result, "scale")
-    assert result.scale is not None
+    assert hasattr(result, "scales")
+    assert result.scales is not None
+    assert result.scales.shape == (64, 1)  # (out_features, n_groups)
     assert hasattr(result, "shape")
     assert result.shape == (64, 128)
 
